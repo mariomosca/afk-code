@@ -1,14 +1,18 @@
 /**
  * Telegram Bot using Claude Agent SDK
  *
- * Replaces PTY-based approach with direct SDK integration.
+ * Features:
+ * - Multi-session support
+ * - Session resume
+ * - Project selection
+ * - Tool approval via inline keyboard
  */
 
 import { Bot, Context, InlineKeyboard } from 'grammy';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { homedir } from 'os';
-import { readdir, stat } from 'fs/promises';
-import { join } from 'path';
+import { readdir, stat, readFile } from 'fs/promises';
+import { join, basename } from 'path';
 import type {
   Query,
   SDKMessage,
@@ -19,8 +23,10 @@ import type { TelegramConfig } from './types.js';
 
 const MAX_MESSAGE_LENGTH = 4000;
 const PROJECTS_ROOT = `${homedir()}/Desktop/Projects`;
+const CLAUDE_PROJECTS_DIR = `${homedir()}/.claude/projects`;
 
 interface PendingApproval {
+  sessionNum: number;
   toolUseId: string;
   toolName: string;
   input: Record<string, unknown>;
@@ -29,10 +35,20 @@ interface PendingApproval {
 }
 
 interface ActiveSession {
+  num: number;
   query: Query;
   sessionId: string;
+  projectName: string;
+  projectPath: string;
   startedAt: Date;
-  pendingApprovals: Map<string, PendingApproval>;
+  isResumed: boolean;
+}
+
+interface SavedSession {
+  sessionId: string;
+  projectPath: string;
+  projectName: string;
+  lastModified: Date;
 }
 
 /**
@@ -42,7 +58,7 @@ async function findProject(searchTerm: string): Promise<{ path: string; name: st
   const searchLower = searchTerm.toLowerCase().replace(/[-_\s]/g, '');
 
   async function searchDir(dir: string, depth = 0): Promise<{ path: string; name: string } | null> {
-    if (depth > 3) return null; // Max depth
+    if (depth > 3) return null;
 
     try {
       const entries = await readdir(dir, { withFileTypes: true });
@@ -53,12 +69,10 @@ async function findProject(searchTerm: string): Promise<{ path: string; name: st
         const entryLower = entry.name.toLowerCase().replace(/[-_\s]/g, '');
         const fullPath = join(dir, entry.name);
 
-        // Exact or partial match
         if (entryLower === searchLower || entryLower.includes(searchLower)) {
           return { path: fullPath, name: entry.name };
         }
 
-        // Recurse into subdirectories
         const found = await searchDir(fullPath, depth + 1);
         if (found) return found;
       }
@@ -90,7 +104,6 @@ async function listProjects(): Promise<string[]> {
         const fullPath = join(dir, entry.name);
         const displayName = prefix ? `${prefix}/${entry.name}` : entry.name;
 
-        // Check if it looks like a project (has package.json, .git, etc.)
         try {
           const hasGit = await stat(join(fullPath, '.git')).then(() => true).catch(() => false);
           const hasPackage = await stat(join(fullPath, 'package.json')).then(() => true).catch(() => false);
@@ -98,7 +111,6 @@ async function listProjects(): Promise<string[]> {
           if (hasGit || hasPackage) {
             projects.push(displayName);
           } else {
-            // Recurse into category folders
             await collectProjects(fullPath, displayName, depth + 1);
           }
         } catch {
@@ -115,11 +127,54 @@ async function listProjects(): Promise<string[]> {
 }
 
 /**
+ * List saved sessions that can be resumed
+ */
+async function listSavedSessions(): Promise<SavedSession[]> {
+  const sessions: SavedSession[] = [];
+
+  try {
+    const projectDirs = await readdir(CLAUDE_PROJECTS_DIR, { withFileTypes: true });
+
+    for (const projectDir of projectDirs) {
+      if (!projectDir.isDirectory()) continue;
+
+      const projectPath = join(CLAUDE_PROJECTS_DIR, projectDir.name);
+
+      try {
+        const files = await readdir(projectPath);
+        const jsonlFiles = files.filter(f => f.endsWith('.jsonl') && !f.includes('compact'));
+
+        for (const jsonlFile of jsonlFiles) {
+          const filePath = join(projectPath, jsonlFile);
+          const stats = await stat(filePath);
+
+          // Decode project path from directory name
+          const decodedPath = '/' + projectDir.name.replace(/-/g, '/').slice(1);
+          const projectName = basename(decodedPath);
+
+          sessions.push({
+            sessionId: jsonlFile.replace('.jsonl', ''),
+            projectPath: decodedPath,
+            projectName,
+            lastModified: stats.mtime,
+          });
+        }
+      } catch {
+        // Ignore errors reading project dir
+      }
+    }
+  } catch {
+    // Ignore if directory doesn't exist
+  }
+
+  // Sort by last modified, most recent first
+  return sessions.sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime());
+}
+
+/**
  * Parse message for project prefix
- * Formats: "su ProjectName: prompt" or "@ProjectName prompt" or "in ProjectName: prompt"
  */
 function parseProjectFromMessage(text: string): { project: string | null; prompt: string } {
-  // Pattern: "su/in/on ProjectName: prompt" or "@ProjectName prompt"
   const patterns = [
     /^(?:su|in|on)\s+([^\s:]+):\s*(.+)$/is,
     /^@([^\s]+)\s+(.+)$/is,
@@ -138,13 +193,19 @@ function parseProjectFromMessage(text: string): { project: string | null; prompt
 export function createTelegramSDKApp(config: TelegramConfig) {
   const bot = new Bot(config.botToken);
 
-  let activeSession: ActiveSession | null = null;
+  // Multi-session state
+  const sessions = new Map<number, ActiveSession>();
+  const pendingApprovals = new Map<string, PendingApproval>();
+  let sessionCounter = 0;
+  let currentSessionNum: number | null = null;
+
+  // Default project
   let currentProjectPath: string = process.cwd();
   let currentProjectName: string = 'default';
+
   const messageQueue: Array<() => Promise<void>> = [];
   let processingQueue = false;
 
-  // Message queue for rate limiting
   async function processQueue() {
     if (processingQueue) return;
     processingQueue = true;
@@ -184,7 +245,6 @@ export function createTelegramSDKApp(config: TelegramConfig) {
           });
           resolve(msg.message_id);
         } catch (err: any) {
-          // If markdown fails, try without formatting
           if (options?.parseMode && err.message?.includes('parse')) {
             const msg = await bot.api.sendMessage(config.chatId, text, {
               disable_notification: options?.disableNotification,
@@ -220,125 +280,155 @@ export function createTelegramSDKApp(config: TelegramConfig) {
     }
   }
 
-  // Tool approval callback
-  const canUseTool: CanUseTool = async (toolName, input, options) => {
-    return new Promise((resolve) => {
-      const { toolUseID } = options;
+  // Tool approval callback factory (creates callback for specific session)
+  function createCanUseTool(sessionNum: number): CanUseTool {
+    return async (toolName, input, options) => {
+      return new Promise((resolve) => {
+        const { toolUseID } = options;
+        const session = sessions.get(sessionNum);
+        const sessionLabel = session ? `[${sessionNum}] ${session.projectName}` : `[${sessionNum}]`;
 
-      // Format tool input for display
-      const inputPreview = JSON.stringify(input, null, 2).slice(0, 500);
+        const inputPreview = JSON.stringify(input, null, 2).slice(0, 500);
 
-      const keyboard = new InlineKeyboard()
-        .text('Allow', `approve:${toolUseID}`)
-        .text('Deny', `deny:${toolUseID}`);
+        const keyboard = new InlineKeyboard()
+          .text('Allow', `approve:${toolUseID}`)
+          .text('Deny', `deny:${toolUseID}`);
 
-      // Send approval request
-      sendMessage(
-        `*Tool Request*\n\n` +
-          `Tool: \`${toolName}\`\n` +
-          `Reason: ${options.decisionReason ?? 'Permission required'}\n\n` +
-          `\`\`\`\n${inputPreview}\n\`\`\``,
-        { replyMarkup: keyboard }
-      ).then((messageId) => {
-        // Store pending approval
-        const timeout = setTimeout(() => {
-          activeSession?.pendingApprovals.delete(toolUseID);
-          resolve({ behavior: 'deny', message: 'Approval timeout (60s)' });
-          sendMessage('Tool request timed out.');
-        }, 60000);
+        sendMessage(
+          `*Tool Request* ${sessionLabel}\n\n` +
+            `Tool: \`${toolName}\`\n` +
+            `Reason: ${options.decisionReason ?? 'Permission required'}\n\n` +
+            `\`\`\`\n${inputPreview}\n\`\`\``,
+          { replyMarkup: keyboard }
+        ).then(() => {
+          const timeout = setTimeout(() => {
+            pendingApprovals.delete(toolUseID);
+            resolve({ behavior: 'deny', message: 'Approval timeout (60s)' });
+            sendMessage(`Tool request timed out. ${sessionLabel}`);
+          }, 60000);
 
-        activeSession?.pendingApprovals.set(toolUseID, {
-          toolUseId: toolUseID,
-          toolName,
-          input,
-          resolve,
-          timeout,
+          pendingApprovals.set(toolUseID, {
+            sessionNum,
+            toolUseId: toolUseID,
+            toolName,
+            input,
+            resolve,
+            timeout,
+          });
         });
       });
-    });
-  };
+    };
+  }
 
-  // Handle SDK messages
-  function handleSDKMessage(message: SDKMessage): void {
-    switch (message.type) {
-      case 'system':
-        if (message.subtype === 'init') {
-          sendMessage(
-            `Session started\n` +
-              `Model: \`${message.model}\`\n` +
-              `Directory: \`${message.cwd}\``
-          );
-        } else if (message.subtype === 'status' && message.status === 'compacting') {
-          sendMessage('_Compacting conversation..._');
-        }
-        break;
+  // Handle SDK messages for a specific session
+  function createMessageHandler(sessionNum: number) {
+    return (message: SDKMessage): void => {
+      const session = sessions.get(sessionNum);
+      const prefix = sessions.size > 1 ? `[${sessionNum}] ` : '';
 
-      case 'assistant':
-        // Extract text from assistant message
-        for (const block of message.message.content) {
-          if (block.type === 'text' && block.text) {
-            sendChunkedMessage(block.text, '_Claude:_');
+      switch (message.type) {
+        case 'system':
+          if (message.subtype === 'init') {
+            if (session) {
+              session.sessionId = message.session_id;
+            }
+            const resumeLabel = session?.isResumed ? ' (resumed)' : '';
+            sendMessage(
+              `${prefix}Session started${resumeLabel}\n` +
+                `Model: \`${message.model}\`\n` +
+                `Project: \`${session?.projectName ?? 'unknown'}\``
+            );
+          } else if (message.subtype === 'status' && message.status === 'compacting') {
+            sendMessage(`${prefix}_Compacting conversation..._`);
           }
-        }
-        break;
+          break;
 
-      case 'result':
-        if (message.subtype === 'success') {
-          sendMessage(
-            `Session complete\n` +
-              `Duration: ${(message.duration_ms / 1000).toFixed(1)}s\n` +
-              `Cost: $${message.total_cost_usd.toFixed(4)}`
-          );
-        } else {
-          sendMessage(`Session error: ${(message as any).error ?? 'Unknown error'}`);
-        }
-        activeSession = null;
-        break;
-    }
+        case 'assistant':
+          for (const block of message.message.content) {
+            if (block.type === 'text' && block.text) {
+              sendChunkedMessage(block.text, `${prefix}_Claude:_`);
+            }
+          }
+          break;
+
+        case 'result':
+          if (message.subtype === 'success') {
+            sendMessage(
+              `${prefix}Session complete\n` +
+                `Duration: ${(message.duration_ms / 1000).toFixed(1)}s\n` +
+                `Cost: $${message.total_cost_usd.toFixed(4)}`
+            );
+          } else {
+            sendMessage(`${prefix}Session error: ${(message as any).error ?? 'Unknown error'}`);
+          }
+          // Remove session
+          sessions.delete(sessionNum);
+          if (currentSessionNum === sessionNum) {
+            // Switch to another session or null
+            const remaining = Array.from(sessions.keys());
+            currentSessionNum = remaining.length > 0 ? remaining[0] : null;
+          }
+          break;
+      }
+    };
   }
 
   // Start a new SDK session
-  async function startSession(prompt: string, cwd: string): Promise<void> {
-    if (activeSession) {
-      await sendMessage('Session already active. Use /stop first.');
-      return;
-    }
+  async function startSession(
+    prompt: string,
+    projectPath: string,
+    projectName: string,
+    resumeSessionId?: string
+  ): Promise<number> {
+    const sessionNum = ++sessionCounter;
 
-    await sendMessage(`Starting session...\nPrompt: ${prompt.slice(0, 100)}...`);
+    await sendMessage(
+      `[${sessionNum}] Starting session on \`${projectName}\`...\n` +
+        `Prompt: ${prompt.slice(0, 80)}${prompt.length > 80 ? '...' : ''}`
+    );
 
     const q = query({
       prompt,
       options: {
-        cwd,
-        canUseTool,
-        // Safe tools are auto-allowed
+        cwd: projectPath,
+        canUseTool: createCanUseTool(sessionNum),
         allowedTools: ['Read', 'Glob', 'Grep', 'LS', 'WebFetch', 'WebSearch'],
+        ...(resumeSessionId ? { resume: resumeSessionId } : {}),
       },
     });
 
-    activeSession = {
+    const session: ActiveSession = {
+      num: sessionNum,
       query: q,
-      sessionId: '',
+      sessionId: resumeSessionId ?? '',
+      projectName,
+      projectPath,
       startedAt: new Date(),
-      pendingApprovals: new Map(),
+      isResumed: !!resumeSessionId,
     };
 
+    sessions.set(sessionNum, session);
+    currentSessionNum = sessionNum;
+
     // Process messages
+    const handleMessage = createMessageHandler(sessionNum);
     (async () => {
       try {
         for await (const message of q) {
-          // Capture session ID
-          if (message.type === 'system' && message.subtype === 'init') {
-            activeSession!.sessionId = message.session_id;
-          }
-          handleSDKMessage(message);
+          handleMessage(message);
         }
       } catch (err: any) {
-        console.error('[SDK] Error:', err);
-        await sendMessage(`Session error: ${err.message}`);
-        activeSession = null;
+        console.error(`[SDK] Session ${sessionNum} error:`, err);
+        await sendMessage(`[${sessionNum}] Session error: ${err.message}`);
+        sessions.delete(sessionNum);
+        if (currentSessionNum === sessionNum) {
+          const remaining = Array.from(sessions.keys());
+          currentSessionNum = remaining.length > 0 ? remaining[0] : null;
+        }
       }
     })();
+
+    return sessionNum;
   }
 
   // Handle callback queries (button presses)
@@ -346,14 +436,14 @@ export function createTelegramSDKApp(config: TelegramConfig) {
     const data = ctx.callbackQuery.data;
     const [action, toolUseId] = data.split(':');
 
-    const approval = activeSession?.pendingApprovals.get(toolUseId);
+    const approval = pendingApprovals.get(toolUseId);
     if (!approval) {
       await ctx.answerCallbackQuery({ text: 'Request expired or not found' });
       return;
     }
 
     clearTimeout(approval.timeout);
-    activeSession?.pendingApprovals.delete(toolUseId);
+    pendingApprovals.delete(toolUseId);
 
     if (action === 'approve') {
       approval.resolve({ behavior: 'allow', updatedInput: approval.input });
@@ -378,39 +468,29 @@ export function createTelegramSDKApp(config: TelegramConfig) {
 
     const text = ctx.message.text;
 
-    // Commands
     if (text.startsWith('/')) {
       await handleCommand(ctx, text);
       return;
     }
 
-    // If no session, start one with the message as prompt
-    if (!activeSession) {
-      // Parse for project prefix
-      const { project, prompt } = parseProjectFromMessage(text);
+    // Parse for project prefix
+    const { project, prompt } = parseProjectFromMessage(text);
 
-      let targetPath = currentProjectPath;
-      let targetName = currentProjectName;
+    let targetPath = currentProjectPath;
+    let targetName = currentProjectName;
 
-      if (project) {
-        const found = await findProject(project);
-        if (found) {
-          targetPath = found.path;
-          targetName = found.name;
-          await sendMessage(`Project: \`${found.name}\``);
-        } else {
-          await ctx.reply(`Project "${project}" not found. Use /projects to list available.`);
-          return;
-        }
+    if (project) {
+      const found = await findProject(project);
+      if (found) {
+        targetPath = found.path;
+        targetName = found.name;
+      } else {
+        await ctx.reply(`Project "${project}" not found. Use /projects to list available.`);
+        return;
       }
-
-      await startSession(prompt, targetPath);
-      return;
     }
 
-    // TODO: Send follow-up message to active session
-    // This requires streamInput which is more complex
-    await ctx.reply('Follow-up messages not yet implemented. Use /stop to end session.');
+    await startSession(prompt, targetPath, targetName);
   });
 
   async function handleCommand(ctx: Context, text: string) {
@@ -424,15 +504,110 @@ export function createTelegramSDKApp(config: TelegramConfig) {
             `*Project syntax:*\n` +
             `\`su ProjectName: your prompt\`\n` +
             `\`@ProjectName your prompt\`\n\n` +
-            `Commands:\n` +
-            `/project <name> - Set current project\n` +
+            `*Commands:*\n` +
+            `/sessions - List active sessions\n` +
+            `/switch <n> - Switch to session n\n` +
+            `/stop [n] - Stop session (current or n)\n` +
+            `/resume [id] - Resume a saved session\n` +
+            `/project <name> - Set default project\n` +
             `/projects - List available projects\n` +
-            `/stop - Stop current session\n` +
-            `/status - Show session status\n` +
-            `/help - Show this message`,
+            `/help - Show all commands`,
           { parse_mode: 'Markdown' }
         );
         break;
+
+      case '/sessions': {
+        if (sessions.size === 0) {
+          await ctx.reply('No active sessions.');
+          return;
+        }
+
+        const list = Array.from(sessions.values())
+          .map((s) => {
+            const current = s.num === currentSessionNum ? ' *← current*' : '';
+            const elapsed = Math.floor((Date.now() - s.startedAt.getTime()) / 1000);
+            const resumed = s.isResumed ? ' (resumed)' : '';
+            return `[${s.num}] \`${s.projectName}\`${resumed} - ${elapsed}s${current}`;
+          })
+          .join('\n');
+
+        await ctx.reply(`*Active Sessions:*\n\n${list}`, { parse_mode: 'Markdown' });
+        break;
+      }
+
+      case '/switch': {
+        const num = parseInt(args[0]);
+        if (isNaN(num) || !sessions.has(num)) {
+          await ctx.reply(
+            `Invalid session number. Active: ${Array.from(sessions.keys()).join(', ') || 'none'}`
+          );
+          return;
+        }
+        currentSessionNum = num;
+        const session = sessions.get(num)!;
+        await ctx.reply(`Switched to session [${num}] \`${session.projectName}\``, {
+          parse_mode: 'Markdown',
+        });
+        break;
+      }
+
+      case '/stop': {
+        const num = args[0] ? parseInt(args[0]) : currentSessionNum;
+        if (num === null || !sessions.has(num)) {
+          await ctx.reply('No session to stop.');
+          return;
+        }
+        const session = sessions.get(num)!;
+        session.query.close();
+        sessions.delete(num);
+        if (currentSessionNum === num) {
+          const remaining = Array.from(sessions.keys());
+          currentSessionNum = remaining.length > 0 ? remaining[0] : null;
+        }
+        await ctx.reply(`Session [${num}] \`${session.projectName}\` stopped.`, {
+          parse_mode: 'Markdown',
+        });
+        break;
+      }
+
+      case '/resume': {
+        const sessionIdArg = args[0];
+
+        if (!sessionIdArg) {
+          // List available sessions to resume
+          const saved = await listSavedSessions();
+          if (saved.length === 0) {
+            await ctx.reply('No saved sessions found.');
+            return;
+          }
+
+          const list = saved.slice(0, 10).map((s) => {
+            const ago = Math.floor((Date.now() - s.lastModified.getTime()) / 60000);
+            const agoStr = ago < 60 ? `${ago}m ago` : `${Math.floor(ago / 60)}h ago`;
+            return `\`${s.sessionId.slice(0, 8)}\` - ${s.projectName} (${agoStr})`;
+          }).join('\n');
+
+          await ctx.reply(
+            `*Recent Sessions:*\n\n${list}\n\n` +
+              `Use \`/resume <id> [prompt]\` to resume.`,
+            { parse_mode: 'Markdown' }
+          );
+          return;
+        }
+
+        // Find the session
+        const saved = await listSavedSessions();
+        const match = saved.find((s) => s.sessionId.startsWith(sessionIdArg));
+
+        if (!match) {
+          await ctx.reply(`Session "${sessionIdArg}" not found.`);
+          return;
+        }
+
+        const prompt = args.slice(1).join(' ') || 'Continue where we left off.';
+        await startSession(prompt, match.projectPath, match.projectName, match.sessionId);
+        break;
+      }
 
       case '/project': {
         const projectName = args.join(' ').trim();
@@ -480,58 +655,65 @@ export function createTelegramSDKApp(config: TelegramConfig) {
         break;
       }
 
-      case '/stop':
-        if (activeSession) {
-          activeSession.query.close();
-          activeSession = null;
-          await ctx.reply('Session stopped.');
-        } else {
-          await ctx.reply('No active session.');
-        }
-        break;
-
-      case '/status':
-        if (activeSession) {
-          const elapsed = Date.now() - activeSession.startedAt.getTime();
+      case '/status': {
+        if (sessions.size === 0) {
           await ctx.reply(
-            `*Active Session*\n` +
-              `ID: \`${activeSession.sessionId}\`\n` +
-              `Project: \`${currentProjectName}\`\n` +
-              `Duration: ${(elapsed / 1000).toFixed(0)}s\n` +
-              `Pending approvals: ${activeSession.pendingApprovals.size}`,
-            { parse_mode: 'Markdown' }
-          );
-        } else {
-          await ctx.reply(
-            `No active session.\n` +
+            `No active sessions.\n` +
               `Current project: \`${currentProjectName}\``,
             { parse_mode: 'Markdown' }
           );
+          return;
         }
-        break;
 
-      case '/interrupt':
-        if (activeSession) {
-          await activeSession.query.interrupt();
-          await ctx.reply('Interrupt sent.');
-        } else {
-          await ctx.reply('No active session.');
+        const session = currentSessionNum ? sessions.get(currentSessionNum) : null;
+        if (session) {
+          const elapsed = Date.now() - session.startedAt.getTime();
+          const pendingCount = Array.from(pendingApprovals.values())
+            .filter((a) => a.sessionNum === session.num).length;
+          await ctx.reply(
+            `*Current Session [${session.num}]*\n` +
+              `ID: \`${session.sessionId.slice(0, 8)}...\`\n` +
+              `Project: \`${session.projectName}\`\n` +
+              `Duration: ${(elapsed / 1000).toFixed(0)}s\n` +
+              `Pending approvals: ${pendingCount}\n` +
+              `Total sessions: ${sessions.size}`,
+            { parse_mode: 'Markdown' }
+          );
         }
         break;
+      }
+
+      case '/interrupt': {
+        const num = args[0] ? parseInt(args[0]) : currentSessionNum;
+        if (num === null || !sessions.has(num)) {
+          await ctx.reply('No session to interrupt.');
+          return;
+        }
+        const session = sessions.get(num)!;
+        await session.query.interrupt();
+        await ctx.reply(`Interrupt sent to [${num}] \`${session.projectName}\``, {
+          parse_mode: 'Markdown',
+        });
+        break;
+      }
 
       case '/help':
         await ctx.reply(
           `*Commands:*\n\n` +
-            `/project <name> - Set current project\n` +
-            `/projects - List available projects\n` +
-            `/stop - Stop current session\n` +
-            `/status - Show session status\n` +
-            `/interrupt - Interrupt current task\n` +
-            `/help - Show this message\n\n` +
-            `*Project syntax:*\n` +
+            `*Sessions:*\n` +
+            `/sessions - List active sessions\n` +
+            `/switch <n> - Switch to session n\n` +
+            `/stop [n] - Stop session\n` +
+            `/interrupt [n] - Interrupt session\n` +
+            `/status - Current session info\n` +
+            `/resume [id] - Resume saved session\n\n` +
+            `*Projects:*\n` +
+            `/project <name> - Set default project\n` +
+            `/projects - List available projects\n\n` +
+            `*Syntax:*\n` +
             `\`su ProjectName: prompt\`\n` +
             `\`@ProjectName prompt\`\n\n` +
-            `_Or set project with /project, then send prompts._`,
+            `_Multiple sessions run in parallel._`,
           { parse_mode: 'Markdown' }
         );
         break;
