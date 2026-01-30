@@ -36,13 +36,16 @@
     "cli"
   ],
   "license": "MIT",
-"dependencies": {
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.25",
     "@slack/bolt": "^4.6.0",
     "discord.js": "^14.25.1",
     "grammy": "^1.35.0",
     "node-pty": "^1.0.0"
   },
   "devDependencies": {
+    "@anthropic-ai/sdk": "^0.72.1",
+    "@modelcontextprotocol/sdk": "^1.25.3",
     "@types/node": "^20.0.0",
     "tsup": "^8.0.0",
     "tsx": "^4.0.0",

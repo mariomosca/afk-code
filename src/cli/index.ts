@@ -1,7 +1,7 @@
 import { run } from './run.js';
 import { slackSetup, slackRun } from './slack.js';
 import { discordSetup, discordRun } from './discord.js';
-import { telegramSetup, telegramRun } from './telegram.js';
+import { telegramSetup, telegramRun, telegramSDKRun } from './telegram.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -46,9 +46,16 @@ async function main() {
     case 'telegram': {
       if (args[1] === 'setup') {
         await telegramSetup();
+      } else if (args[1] === 'sdk') {
+        await telegramSDKRun();
       } else {
         await telegramRun();
       }
+      break;
+    }
+
+    case 'telegram-sdk': {
+      await telegramSDKRun();
       break;
     }
 
@@ -60,7 +67,8 @@ async function main() {
 AFK Code - Monitor Claude Code sessions from Slack/Discord/Telegram
 
 Commands:
-  telegram           Run the Telegram bot
+  telegram           Run the Telegram bot (PTY-based)
+  telegram sdk       Run the Telegram bot (SDK-based)
   telegram setup     Configure Telegram integration
   discord            Run the Discord bot
   discord setup      Configure Discord integration
@@ -71,7 +79,8 @@ Commands:
 
 Examples:
   afk-code telegram setup   # First-time Telegram configuration
-  afk-code telegram         # Start the Telegram bot
+  afk-code telegram         # Start the Telegram bot (PTY)
+  afk-code telegram sdk     # Start the Telegram bot (SDK)
   afk-code discord setup    # First-time Discord configuration
   afk-code discord          # Start the Discord bot
   afk-code slack setup      # First-time Slack configuration

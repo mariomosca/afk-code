@@ -106,6 +106,53 @@ async function loadEnvFile(path: string): Promise<Record<string, string>> {
   return config;
 }
 
+export async function telegramSDKRun(): Promise<void> {
+  // Load config
+  const globalConfig = await loadEnvFile(TELEGRAM_CONFIG_FILE);
+  const localConfig = await loadEnvFile(`${process.cwd()}/.env`);
+
+  const config: Record<string, string> = {
+    ...globalConfig,
+    ...localConfig,
+  };
+
+  // Environment variables take highest precedence
+  if (process.env.TELEGRAM_BOT_TOKEN) config.TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+  if (process.env.TELEGRAM_CHAT_ID) config.TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+  // Validate required config
+  const required = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'];
+  const missing = required.filter((key) => !config[key]);
+
+  if (missing.length > 0) {
+    console.error(`Missing config: ${missing.join(', ')}`);
+    console.error('');
+    console.error('Run "afk-code telegram setup" for guided configuration.');
+    process.exit(1);
+  }
+
+  console.log('[AFK Code] Starting Telegram SDK bot...');
+
+  // Import and create the SDK-based Telegram app
+  const { createTelegramSDKApp } = await import('../telegram/telegram-sdk-app.js');
+
+  const telegramConfig = {
+    botToken: config.TELEGRAM_BOT_TOKEN,
+    chatId: config.TELEGRAM_CHAT_ID,
+  };
+
+  const { bot } = createTelegramSDKApp(telegramConfig);
+
+  // Start bot
+  bot.start({
+    onStart: (botInfo) => {
+      console.log(`[AFK Code] Telegram SDK bot @${botInfo.username} is running!`);
+      console.log('');
+      console.log('Send a message to your bot to start a Claude session.');
+    },
+  });
+}
+
 export async function telegramRun(): Promise<void> {
   // Load config
   const globalConfig = await loadEnvFile(TELEGRAM_CONFIG_FILE);
